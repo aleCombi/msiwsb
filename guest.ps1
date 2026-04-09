@@ -1,49 +1,48 @@
-# guest.ps1 — Runs inside Windows Sandbox
-# Expects $SharedFolder to be passed as argument (mapped folder path inside WSB)
+# guest.ps1 - Runs inside Windows Sandbox
 param(
     [Parameter(Mandatory)][string]$SharedFolder,
     [Parameter(Mandatory)][string]$InstallerName,
-    [string]$InstallerArgs = ""
+    [string]$InstallerArgs = ''
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-$hives = @(
-    @{ Name = "HKLM"; Path = "HKLM" },
-    @{ Name = "HKCU"; Path = "HKCU" }
+# Registry subtrees that installers typically write to
+$subtrees = @(
+    'HKLM\SOFTWARE',
+    'HKLM\SYSTEM\CurrentControlSet\Services',
+    'HKLM\SYSTEM\CurrentControlSet\Control',
+    'HKCU\SOFTWARE'
 )
 
 $beforeDir = "$env:TEMP\reg_before"
 $afterDir  = "$env:TEMP\reg_after"
 New-Item -ItemType Directory -Path $beforeDir, $afterDir -Force | Out-Null
 
-function Export-RegistryHives {
+function Export-Subtrees {
     param([string]$OutDir)
-    foreach ($hive in $hives) {
-        $outFile = Join-Path $OutDir "$($hive.Name).reg"
-        Write-Host "Exporting $($hive.Path) -> $outFile"
-        reg export $hive.Path $outFile /y | Out-Null
+    foreach ($sub in $subtrees) {
+        $safeName = $sub -replace '\\', '_'
+        $outFile = Join-Path $OutDir "$safeName.reg"
+        Write-Host "  Exporting $sub"
+        reg export $sub $outFile /y 2>&1 | Out-Null
     }
 }
 
 # --- Step 1: Export BEFORE snapshot ---
-Write-Host "`n=== Exporting registry BEFORE installation ==="
-Export-RegistryHives -OutDir $beforeDir
+Write-Host 'Exporting registry BEFORE installation...'
+Export-Subtrees -OutDir $beforeDir
 
 # --- Step 2: Run the installer ---
 $installerPath = Join-Path $SharedFolder $InstallerName
-Write-Host "`n=== Running installer: $installerPath ==="
+Write-Host "Running installer: $installerPath"
 
 $ext = [System.IO.Path]::GetExtension($installerPath).ToLower()
 switch ($ext) {
-    ".msi" {
+    '.msi' {
         $msiArgs = "/i `"$installerPath`" /qn /norestart /l*v `"$SharedFolder\_msi_install_log.txt`" $InstallerArgs"
         Write-Host "msiexec $msiArgs"
         $proc = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru
-    }
-    ".exe" {
-        Write-Host "$installerPath $InstallerArgs"
-        $proc = Start-Process $installerPath -ArgumentList $InstallerArgs -Wait -PassThru
     }
     default {
         Write-Host "$installerPath $InstallerArgs"
@@ -53,74 +52,74 @@ switch ($ext) {
 Write-Host "Installer exited with code: $($proc.ExitCode)"
 
 # --- Step 3: Export AFTER snapshot ---
-Write-Host "`n=== Exporting registry AFTER installation ==="
-Export-RegistryHives -OutDir $afterDir
+Write-Host 'Exporting registry AFTER installation...'
+Export-Subtrees -OutDir $afterDir
 
-# --- Step 4: Compute diff and write .reg file ---
-Write-Host "`n=== Computing registry diff ==="
+# --- Step 4: Compute diff using file comparison ---
+Write-Host 'Computing registry diff...'
 
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $diffFile = Join-Path $SharedFolder "registry_diff_$timestamp.reg"
 
-# Header for the combined .reg file
-$output = @("Windows Registry Editor Version 5.00", "")
+# Use a StreamWriter for performance
+$writer = [System.IO.StreamWriter]::new($diffFile, $false, [System.Text.Encoding]::Unicode)
+$writer.WriteLine('Windows Registry Editor Version 5.00')
+$writer.WriteLine('')
 
-foreach ($hive in $hives) {
-    $beforeFile = Join-Path $beforeDir "$($hive.Name).reg"
-    $afterFile  = Join-Path $afterDir  "$($hive.Name).reg"
+$totalKeys = 0
+
+foreach ($sub in $subtrees) {
+    $safeName = $sub -replace '\\', '_'
+    $beforeFile = Join-Path $beforeDir "$safeName.reg"
+    $afterFile  = Join-Path $afterDir  "$safeName.reg"
 
     if (-not (Test-Path $afterFile)) { continue }
-
-    Write-Host "Diffing $($hive.Name)..."
-
-    # Parse .reg files into dictionaries: key+value -> line
-    function Parse-RegFile {
-        param([string]$Path)
-        $entries = [ordered]@{}
-        $currentKey = ""
-        foreach ($line in (Get-Content $Path -Encoding Unicode)) {
-            $line = $line.TrimEnd()
-            if ($line -match '^\[(.+)\]$') {
-                $currentKey = $line
-            }
-            elseif ($line -ne "" -and -not $line.StartsWith("Windows Registry Editor")) {
-                $entries["$currentKey|$line"] = $true
+    if (-not (Test-Path $beforeFile)) {
+        # Entire subtree is new, copy as-is
+        foreach ($line in [System.IO.File]::ReadLines($afterFile, [System.Text.Encoding]::Unicode)) {
+            if (-not $line.StartsWith('Windows Registry Editor')) {
+                $writer.WriteLine($line)
             }
         }
-        return $entries
+        continue
     }
 
-    $before = Parse-RegFile $beforeFile
-    $after  = Parse-RegFile $afterFile
+    Write-Host "  Diffing $sub..."
 
-    # Find entries in AFTER that are not in BEFORE (new or changed)
-    $newEntries = [ordered]@{}
-    foreach ($entry in $after.Keys) {
-        if (-not $before.ContainsKey($entry)) {
-            $parts = $entry -split '\|', 2
-            $key = $parts[0]
-            $val = $parts[1]
-            if (-not $newEntries.ContainsKey($key)) {
-                $newEntries[$key] = @()
-            }
-            $newEntries[$key] += $val
+    # Build hashset of BEFORE lines for fast lookup
+    $beforeSet = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($line in [System.IO.File]::ReadLines($beforeFile, [System.Text.Encoding]::Unicode)) {
+        [void]$beforeSet.Add($line.TrimEnd())
+    }
+
+    # Stream through AFTER file, emit lines not in BEFORE
+    $currentKey = ''
+    $keyWritten = $false
+    foreach ($line in [System.IO.File]::ReadLines($afterFile, [System.Text.Encoding]::Unicode)) {
+        $trimmed = $line.TrimEnd()
+        if ($trimmed -match '^\[.+\]$') {
+            $currentKey = $trimmed
+            $keyWritten = $false
         }
-    }
-
-    # Write new/changed entries grouped by key
-    foreach ($key in $newEntries.Keys) {
-        $output += ""
-        $output += $key
-        foreach ($val in $newEntries[$key]) {
-            $output += $val
+        elseif ($trimmed -eq '' -or $trimmed.StartsWith('Windows Registry Editor')) {
+            continue
+        }
+        elseif (-not $beforeSet.Contains($trimmed)) {
+            if (-not $keyWritten) {
+                $writer.WriteLine('')
+                $writer.WriteLine($currentKey)
+                $keyWritten = $true
+                $totalKeys++
+            }
+            $writer.WriteLine($trimmed)
         }
     }
 }
 
-$output | Out-File -FilePath $diffFile -Encoding Unicode
-$lineCount = ($output | Where-Object { $_ -match '^\[' }).Count
-Write-Host "`n=== Done. $lineCount registry keys changed ==="
+$writer.Close()
+
+Write-Host "$totalKeys registry keys changed"
 Write-Host "Diff written to: $diffFile"
 
 # Signal completion to host
-"done" | Out-File -FilePath (Join-Path $SharedFolder "_guest_done.flag") -Encoding ASCII
+'done' | Out-File -FilePath (Join-Path $SharedFolder '_guest_done.flag') -Encoding ASCII
