@@ -37,7 +37,7 @@ Write-Host "`n=== Running installer: $installerPath ==="
 $ext = [System.IO.Path]::GetExtension($installerPath).ToLower()
 switch ($ext) {
     ".msi" {
-        $msiArgs = "/i `"$installerPath`" /qn /norestart $InstallerArgs"
+        $msiArgs = "/i `"$installerPath`" /qn /norestart /l*v `"$SharedFolder\_msi_install_log.txt`" $InstallerArgs"
         Write-Host "msiexec $msiArgs"
         $proc = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru
     }
