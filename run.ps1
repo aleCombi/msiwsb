@@ -1,6 +1,6 @@
 # run.ps1 — Host script: launches Windows Sandbox with an installer, captures registry diff
 param(
-    [Parameter(Mandatory)][string]$InstallerPath,
+    [string]$InstallerPath = "C:\Users\Aless\Downloads\22.200_64\22.200_64\Quark.msi",
     [string]$InstallerArgs = "",
     [int]$TimeoutSeconds = 600
 )
